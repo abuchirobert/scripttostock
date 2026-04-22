@@ -31,3 +31,4 @@ dist/
 build/
 .pytest_cache/
 REFACTOR_SUMMARY.txt
+.git_broken_*
