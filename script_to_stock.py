@@ -147,7 +147,9 @@ HTML = r"""<!DOCTYPE html>
 
       <!-- Serverless Warning -->
       <div class="bg-amber-950/50 rounded-xl border border-amber-900/50 p-4 text-xs text-amber-200 space-y-1">
-        <p>⏱️ <strong>Processing may take 1–4 minutes.</strong> On serverless hosts (Vercel/Netlify), requests timeout after 60s. For long scripts, run locally or use Render/Railway.</p>
+        <p>⏱️ <strong>Processing may take 1–4 minutes.</strong> </p>
+        
+        <!-- On serverless hosts (Vercel/Netlify), requests timeout after 60s. For long scripts, run locally or use Render/Railway.</p> -->
       </div>
 
       <!-- Tips -->
