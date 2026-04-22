@@ -1,0 +1,25 @@
+# Netlify configuration for ScriptToStock
+# Runs the Flask app as a Python serverless function.
+
+[build]
+  # No build step — we ship Python source directly to the function runtime.
+  command = "echo 'No build required'"
+  publish = "public"
+  functions = "netlify/functions"
+
+[functions]
+  # Each function bundles its own requirements.txt (located alongside the handler).
+  directory = "netlify/functions"
+
+# Route every request through the Flask adapter function.
+[[redirects]]
+  from = "/*"
+  to = "/.netlify/functions/app/:splat"
+  status = 200
+  force = true
+
+# --- Limits note (for reference only, not enforced by this file) -------------
+# Netlify Functions timeout: 10s (free), 26s (paid synchronous).
+# Background Functions: 15min, but they return 202 immediately — async only.
+# This app often runs 1–4 minutes, so it WILL time out on Netlify for most
+# real scripts. Vercel Pro (60s) or Render/Railway are recommended.

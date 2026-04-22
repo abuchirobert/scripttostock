@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.Python
+pip-log.txt
+
+# Vercel
+.vercel/
+
+# Netlify
+.netlify/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local secrets / env
+.env
+.env.*
+!.env.example
+
+# Build artifacts / temp
+*.zip
+dist/
+build/
+.pytest_cache/
+REFACTOR_SUMMARY.txt
