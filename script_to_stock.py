@@ -14,14 +14,49 @@ OPEN IN BROWSER:
 """
 
 import json
-import io
-import zipfile
+import os
 import re
 import time
+from functools import wraps
+from urllib.parse import urlparse
 
-from flask import Flask, request, jsonify, send_file, Response
+from flask import Flask, request, jsonify, Response, session, redirect
+
+import db
+from pages import LOGIN_HTML, ADMIN_HTML
 
 app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'change-me-in-production')
+app.config['PERMANENT_SESSION_LIFETIME'] = 60 * 60 * 24 * 30  # 30 days
+
+ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'admin')
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', '')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTH HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def login_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get('username'):
+            if request.path.startswith('/api/'):
+                return jsonify({'error': 'Not signed in'}), 401
+            return redirect('/login')
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def admin_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get('is_admin'):
+            if request.path.startswith('/api/'):
+                return jsonify({'error': 'Admin access required'}), 403
+            return redirect('/login')
+        return f(*args, **kwargs)
+    return wrapper
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -35,6 +70,7 @@ HTML = r"""<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>ScriptToStock 🎬</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <style>
     @keyframes slide-in {
       from { opacity: 0; transform: translateY(12px); }
@@ -61,11 +97,20 @@ HTML = r"""<!DOCTYPE html>
 
   <!-- Header -->
   <header class="border-b border-slate-800 bg-slate-950/80 backdrop-blur sticky top-0 z-10">
-    <div class="max-w-7xl mx-auto px-6 py-4 flex items-center gap-3">
-      <span class="text-2xl">🎬</span>
-      <div>
-        <h1 class="text-lg font-bold tracking-tight">ScriptToStock</h1>
-        <p class="text-xs text-slate-500">AI-powered stock images synced to your audio · Ready for CapCut</p>
+    <div class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <span class="text-2xl">🎬</span>
+        <div>
+          <h1 class="text-lg font-bold tracking-tight">ScriptToStock</h1>
+          <p class="text-xs text-slate-500">AI-powered stock images synced to your audio · Ready for CapCut</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-3">
+        <div class="text-right">
+          <div id="accountName" class="text-xs text-slate-400"></div>
+          <div id="accountBalance" class="text-sm font-bold text-emerald-300">$—</div>
+        </div>
+        <a href="/logout" class="text-xs bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-slate-300 transition-colors">Log out</a>
       </div>
     </div>
   </header>
@@ -75,38 +120,26 @@ HTML = r"""<!DOCTYPE html>
     <!-- ── LEFT: Inputs (2/5 width) ── -->
     <div class="lg:col-span-2 space-y-5">
 
-      <!-- API Keys -->
+      <!-- Account / Credit -->
       <div class="bg-slate-900 rounded-2xl border border-slate-800 p-5">
-        <h2 class="font-semibold text-sm uppercase tracking-wider text-slate-400 mb-4">🔑 API Keys</h2>
-        <div class="space-y-3">
+        <h2 class="font-semibold text-sm uppercase tracking-wider text-slate-400 mb-4">💳 Your Credit</h2>
+        <div class="flex items-end justify-between mb-3">
           <div>
-            <div class="flex items-center justify-between mb-1">
-              <label class="text-xs text-slate-400">Claude API Key
-                <a href="https://console.anthropic.com" target="_blank" class="text-blue-400 hover:underline ml-1">Get key →</a>
-              </label>
-              <div class="flex items-center gap-1.5">
-                <span id="claudeStatus" class="text-xs px-2 py-0.5 rounded-full border border-slate-700 text-slate-500">Not tested</span>
-                <button onclick="testClaudeKey()" class="text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 px-2 py-0.5 rounded-lg transition-colors">Test</button>
-              </div>
-            </div>
-            <input type="password" id="claudeKey" placeholder="sk-ant-..."
-              class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500 transition-colors"/>
+            <div class="text-xs text-slate-500">Available balance</div>
+            <div id="balanceBig" class="text-3xl font-bold text-emerald-300">$—</div>
           </div>
-          <div>
-            <div class="flex items-center justify-between mb-1">
-              <label class="text-xs text-slate-400">Pexels API Key
-                <a href="https://www.pexels.com/api/" target="_blank" class="text-blue-400 hover:underline ml-1">Free key →</a>
-              </label>
-              <div class="flex items-center gap-1.5">
-                <span id="pexelsStatus" class="text-xs px-2 py-0.5 rounded-full border border-slate-700 text-slate-500">Not tested</span>
-                <button onclick="testPexelsKey()" class="text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 px-2 py-0.5 rounded-lg transition-colors">Test</button>
-              </div>
-            </div>
-            <input type="password" id="pexelsKey" placeholder="Your Pexels API key"
-              class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500 transition-colors"/>
+          <div class="text-right text-xs text-slate-500">
+            <div id="spentInfo"></div>
+            <div id="runsInfo"></div>
           </div>
-          <p class="text-xs text-slate-600">Keys are saved locally in your browser only.</p>
         </div>
+        <div id="lowBalanceWarning" class="hidden bg-red-950/50 border border-red-900/50 rounded-lg p-3 text-xs text-red-200">
+          ⚠️ Your balance is exhausted. Contact the admin to top up your credit.
+        </div>
+        <details class="mt-2">
+          <summary class="text-xs text-slate-500 cursor-pointer hover:text-slate-300">Recent usage</summary>
+          <div id="usageList" class="mt-2 space-y-1 text-xs text-slate-400 max-h-40 overflow-y-auto"></div>
+        </details>
       </div>
 
       <!-- Project Info -->
@@ -145,11 +178,9 @@ HTML = r"""<!DOCTYPE html>
         <span>✨</span> Generate CapCut Images
       </button>
 
-      <!-- Serverless Warning -->
+      <!-- Timing note -->
       <div class="bg-amber-950/50 rounded-xl border border-amber-900/50 p-4 text-xs text-amber-200 space-y-1">
-        <p>⏱️ <strong>Processing may take 1–4 minutes.</strong> </p>
-        
-        <!-- On serverless hosts (Vercel/Netlify), requests timeout after 60s. For long scripts, run locally or use Render/Railway.</p> -->
+        <p>⏱️ <strong>Planning takes ~15–30s</strong>, then media downloads directly in your browser.</p>
       </div>
 
       <!-- Tips -->
@@ -175,13 +206,14 @@ HTML = r"""<!DOCTYPE html>
         <div class="flex items-center justify-between mb-3">
           <div class="flex items-center gap-2">
             <span class="pulse-dot inline-block w-2 h-2 rounded-full bg-blue-500"></span>
-            <span class="font-semibold text-sm">Generating — please wait...</span>
+            <span id="generatingLabel" class="font-semibold text-sm">Analyzing your script...</span>
           </div>
+          <span id="progressCount" class="text-xs text-slate-500"></span>
         </div>
         <div class="bg-slate-800 rounded-full h-2 mb-3 overflow-hidden">
-          <div class="bg-blue-500 h-2 rounded-full animate-pulse" style="width:100%"></div>
+          <div id="progressBar" class="bg-blue-500 h-2 rounded-full transition-all duration-300" style="width:5%"></div>
         </div>
-        <p class="text-xs text-slate-400">This usually takes 1–4 minutes depending on script length and server load.</p>
+        <div id="sceneProgress" class="space-y-1 text-xs text-slate-400 max-h-64 overflow-y-auto"></div>
       </div>
 
       <!-- Success state -->
@@ -215,22 +247,28 @@ HTML = r"""<!DOCTYPE html>
   </main>
 
   <script>
-    // Load keys from localStorage
-    function loadKeys() {
-      const saved = localStorage.getItem('api_keys');
-      if (saved) {
-        const { claude, pexels } = JSON.parse(saved);
-        if (claude) document.getElementById('claudeKey').value = claude;
-        if (pexels) document.getElementById('pexelsKey').value = pexels;
-      }
-    }
-
-    // Save keys to localStorage
-    function saveKeys() {
-      localStorage.setItem('api_keys', JSON.stringify({
-        claude: document.getElementById('claudeKey').value,
-        pexels: document.getElementById('pexelsKey').value
-      }));
+    // ── Account / balance ────────────────────────────────────────────────
+    async function loadAccount() {
+      try {
+        const resp = await fetch('/api/me');
+        if (resp.status === 401) { window.location.href = '/login'; return; }
+        const d = await resp.json();
+        document.getElementById('accountName').textContent = d.username;
+        document.getElementById('accountBalance').textContent = '$' + d.balance.toFixed(2);
+        document.getElementById('balanceBig').textContent = '$' + d.balance.toFixed(2);
+        document.getElementById('spentInfo').textContent = 'Spent: $' + d.total_spent.toFixed(2);
+        document.getElementById('runsInfo').textContent = 'Runs: ' + d.runs;
+        const out = d.balance <= 0;
+        document.getElementById('lowBalanceWarning').classList.toggle('hidden', !out);
+        document.getElementById('balanceBig').className =
+          'text-3xl font-bold ' + (out ? 'text-red-400' : 'text-emerald-300');
+        document.getElementById('generateBtn').disabled = out;
+        document.getElementById('usageList').innerHTML = (d.usage || []).map(u =>
+          `<div class="flex justify-between border-b border-slate-800/50 pb-1">
+             <span>${new Date(u.ts * 1000).toLocaleDateString()} · ${u.title || 'Untitled'}</span>
+             <span class="text-emerald-400">-$${u.charged_usd.toFixed(4)}</span>
+           </div>`).join('') || '<div class="text-slate-600">No runs yet.</div>';
+      } catch (e) { console.warn('Account load failed', e); }
     }
 
     // Update word count and estimated duration
@@ -253,91 +291,48 @@ HTML = r"""<!DOCTYPE html>
       document.getElementById('audioInfo').classList.remove('hidden');
     });
 
-    // Test Claude key
-    async function testClaudeKey() {
-      const key = document.getElementById('claudeKey').value.trim();
-      if (!key) {
-        document.getElementById('claudeStatus').textContent = 'No key';
-        return;
-      }
-      document.getElementById('claudeStatus').textContent = 'Testing...';
+    // ── Generation: plan on server, download + zip in the browser ────────
+    function setProgress(pct, label, count) {
+      document.getElementById('progressBar').style.width = pct + '%';
+      if (label) document.getElementById('generatingLabel').textContent = label;
+      document.getElementById('progressCount').textContent = count || '';
+    }
+
+    function sceneRow(id, text, state) {
+      const icons = { pending: '⏳', ok: '✅', fail: '⚠️' };
+      return `<div id="${id}" class="flex items-center gap-2">
+        <span>${icons[state] || '⏳'}</span><span class="truncate">${text}</span></div>`;
+    }
+
+    async function fetchMedia(url) {
+      // Try direct CDN download first (fast, no server load);
+      // fall back to the server proxy if CORS blocks it.
       try {
-        const resp = await fetch('/api/test-claude', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ claude_key: key })
-        });
-        const data = await resp.json();
-        document.getElementById('claudeStatus').textContent = data.ok ? '✓ Valid' : '✗ Invalid';
-        document.getElementById('claudeStatus').className = data.ok
-          ? 'text-xs px-2 py-0.5 rounded-full border border-emerald-700 text-emerald-300'
-          : 'text-xs px-2 py-0.5 rounded-full border border-red-700 text-red-300';
+        const r = await fetch(url, { mode: 'cors' });
+        if (r.ok) return await r.blob();
+        throw new Error('HTTP ' + r.status);
       } catch (e) {
-        document.getElementById('claudeStatus').textContent = '✗ Error';
-        document.getElementById('claudeStatus').className = 'text-xs px-2 py-0.5 rounded-full border border-red-700 text-red-300';
+        const r = await fetch('/api/proxy-media?url=' + encodeURIComponent(url));
+        if (!r.ok) throw new Error('Proxy failed: HTTP ' + r.status);
+        return await r.blob();
       }
     }
 
-    // Test Pexels key
-    async function testPexelsKey() {
-      const key = document.getElementById('pexelsKey').value.trim();
-      if (!key) {
-        document.getElementById('pexelsStatus').textContent = 'No key';
-        return;
-      }
-      document.getElementById('pexelsStatus').textContent = 'Testing...';
-      try {
-        const resp = await fetch('/api/test-pexels', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pexels_key: key })
-        });
-        const data = await resp.json();
-        document.getElementById('pexelsStatus').textContent = data.ok ? '✓ Valid' : '✗ Invalid';
-        document.getElementById('pexelsStatus').className = data.ok
-          ? 'text-xs px-2 py-0.5 rounded-full border border-emerald-700 text-emerald-300'
-          : 'text-xs px-2 py-0.5 rounded-full border border-red-700 text-red-300';
-      } catch (e) {
-        document.getElementById('pexelsStatus').textContent = '✗ Error';
-        document.getElementById('pexelsStatus').className = 'text-xs px-2 py-0.5 rounded-full border border-red-700 text-red-300';
-      }
-    }
-
-    // Start generation
     async function startGeneration() {
-      saveKeys();
-
       const title = document.getElementById('title').value.trim();
       const script = document.getElementById('script').value.trim();
-      const claudeKey = document.getElementById('claudeKey').value.trim();
-      const pexelsKey = document.getElementById('pexelsKey').value.trim();
       const audioFile = document.getElementById('audioFile').files[0];
 
-      if (!script) {
-        alert('Please enter a script.');
-        return;
-      }
-      if (!claudeKey) {
-        alert('Please enter your Claude API key.');
-        return;
-      }
-      if (!pexelsKey) {
-        alert('Please enter your Pexels API key.');
-        return;
-      }
+      if (!script) { alert('Please enter a script.'); return; }
 
       // Get audio duration if provided
       let audioDuration = null;
       if (audioFile) {
         try {
           const audio = new Audio(URL.createObjectURL(audioFile));
-          await new Promise(resolve => {
-            audio.onloadedmetadata = resolve;
-          });
+          await new Promise(resolve => { audio.onloadedmetadata = resolve; });
           audioDuration = audio.duration;
-        } catch (e) {
-          console.warn('Could not read audio duration:', e);
-        }
+        } catch (e) { console.warn('Could not read audio duration:', e); }
       }
 
       // Show generating state
@@ -345,59 +340,84 @@ HTML = r"""<!DOCTYPE html>
       document.getElementById('successCard').classList.add('hidden');
       document.getElementById('errorCard').classList.add('hidden');
       document.getElementById('generatingCard').classList.remove('hidden');
+      document.getElementById('sceneProgress').innerHTML = '';
       document.getElementById('generateBtn').disabled = true;
+      setProgress(5, 'Analyzing your script with AI...');
 
       try {
-        const resp = await fetch('/api/generate', {
+        // ── Step 1: server plans scenes + finds media URLs ──────────────
+        const resp = await fetch('/api/plan', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            title: title || 'My Video',
-            script,
-            claude_key: claudeKey,
-            pexels_key: pexelsKey,
-            audio_duration: audioDuration
-          })
+          body: JSON.stringify({ title: title || 'My Video', script, audio_duration: audioDuration })
+        });
+        if (resp.status === 401) { window.location.href = '/login'; return; }
+        const plan = await resp.json();
+        if (!resp.ok) throw new Error(plan.error || `HTTP ${resp.status}`);
+
+        // ── Step 2: browser downloads media directly from Pexels CDN ───
+        const scenes = plan.scenes;
+        const toFetch = scenes.filter(s => s.success && s.media_url);
+        setProgress(15, 'Downloading media in your browser...', `0 / ${toFetch.length}`);
+        const progEl = document.getElementById('sceneProgress');
+        toFetch.forEach((s, i) => {
+          progEl.insertAdjacentHTML('beforeend', sceneRow('sc-' + i, s.filename, 'pending'));
         });
 
-        if (!resp.ok) {
-          const errorData = await resp.json();
-          throw new Error(errorData.error || `HTTP ${resp.status}`);
+        const zip = new JSZip();
+        let done = 0;
+        const CONCURRENCY = 4;
+        let cursor = 0;
+        async function worker() {
+          while (cursor < toFetch.length) {
+            const i = cursor++;
+            const s = toFetch[i];
+            try {
+              const blob = await fetchMedia(s.media_url);
+              zip.file(s.filename, blob, { compression: 'STORE' });
+              document.getElementById('sc-' + i).outerHTML = sceneRow('sc-' + i, s.filename, 'ok');
+            } catch (e) {
+              s.success = false;
+              document.getElementById('sc-' + i).outerHTML =
+                sceneRow('sc-' + i, s.filename + ' — download failed', 'fail');
+            }
+            done++;
+            setProgress(15 + Math.round((done / toFetch.length) * 75),
+              'Downloading media in your browser...', `${done} / ${toFetch.length}`);
+          }
         }
+        await Promise.all(Array.from({ length: CONCURRENCY }, worker));
 
-        // Extract stats from response headers
-        const costUsd = resp.headers.get('X-Cost-USD');
-        const scenes = resp.headers.get('X-Scenes');
-        const videos = resp.headers.get('X-Videos');
-        const images = resp.headers.get('X-Images');
-        const duration = resp.headers.get('X-Duration');
-
-        // Store the response for download
-        window.downloadBlob = await resp.blob();
-        window.downloadFilename = extractFilename(resp.headers.get('content-disposition'));
+        // ── Step 3: build the ZIP client-side ───────────────────────────
+        setProgress(92, 'Packaging your ZIP...');
+        zip.file('CAPCUT_IMPORT_GUIDE.txt', plan.guide);
+        zip.file('scenes_data.json', JSON.stringify(plan.scenes.map(({media_url, ...rest}) => rest), null, 2));
+        window.downloadBlob = await zip.generateAsync({ type: 'blob' });
+        window.downloadFilename = plan.zip_name || 'capcut_brolls.zip';
+        setProgress(100, 'Done!');
 
         // Show success state
         document.getElementById('generatingCard').classList.add('hidden');
         document.getElementById('successCard').classList.remove('hidden');
 
-        // Populate stats
+        const st = plan.stats;
         const stats = [
-          { label: '🎬 B-rolls', value: scenes || '?' },
-          { label: '📽 Videos', value: videos || '?' },
-          { label: '🖼 Images', value: images || '?' },
-          { label: '⏱ Duration', value: duration ? `${(parseFloat(duration)).toFixed(1)}s` : '?' },
-          { label: '💰 Cost', value: costUsd ? `$${costUsd}` : '?' }
+          { label: '🎬 B-rolls', value: st.scenes },
+          { label: '📽 Videos', value: st.videos },
+          { label: '🖼 Images', value: st.images },
+          { label: '⏱ Duration', value: `${st.duration.toFixed(1)}s` },
+          { label: '💰 Charged', value: `$${st.charged.toFixed(4)}` },
+          { label: '💳 Balance left', value: `$${st.balance.toFixed(2)}` }
         ];
-
-        const statsHtml = stats.map(s =>
+        document.getElementById('statsContainer').innerHTML = stats.map(s =>
           `<div class="border border-emerald-700 rounded p-2"><div class="text-xs text-emerald-400">${s.label}</div><div class="text-sm font-bold">${s.value}</div></div>`
         ).join('');
-
-        document.getElementById('statsContainer').innerHTML = statsHtml;
+        loadAccount();
       } catch (err) {
         document.getElementById('generatingCard').classList.add('hidden');
         document.getElementById('errorCard').classList.remove('hidden');
         document.getElementById('errorMessage').textContent = err.message;
+        loadAccount();
       } finally {
         document.getElementById('generateBtn').disabled = false;
       }
@@ -416,13 +436,6 @@ HTML = r"""<!DOCTYPE html>
       URL.revokeObjectURL(url);
     }
 
-    // Extract filename from Content-Disposition header
-    function extractFilename(contentDisposition) {
-      if (!contentDisposition) return 'capcut_brolls.zip';
-      const match = contentDisposition.match(/filename[^;=\n]*=(["\']?)([^"\'\n;]*)\1/i);
-      return match ? match[2] : 'capcut_brolls.zip';
-    }
-
     // Reset UI
     function resetUI() {
       document.getElementById('emptyState').classList.remove('hidden');
@@ -431,8 +444,7 @@ HTML = r"""<!DOCTYPE html>
       document.getElementById('errorCard').classList.add('hidden');
     }
 
-    // Load keys on page load
-    loadKeys();
+    loadAccount();
   </script>
 </body>
 </html>
@@ -465,10 +477,12 @@ def make_filename(cumulative_s, description, pexels_label, duration, ext):
     return f"{ts}_{slug}_{duration:.1f}s{ext}"
 
 
-def fetch_pexels_video(query, pexels_key, req_module):
+def find_pexels_video_url(query, pexels_key, req_module):
     """
-    Search Pexels Videos API and return (bytes, photographer, alt_title).
-    Prefers 720p MP4. Returns (None, None, None) if nothing found.
+    Search Pexels Videos API and return (download_url, photographer, alt_title).
+    Picks the HIGHEST quality MP4 capped at 1080p. Metadata only — the actual
+    file is downloaded by the user's browser straight from the Pexels CDN.
+    Returns (None, None, None) if nothing found.
     """
     req = req_module
     fallbacks = [
@@ -493,28 +507,27 @@ def fetch_pexels_video(query, pexels_key, req_module):
             photographer = video.get('user', {}).get('name', 'Pexels')
             alt_title = video.get('url', '').rstrip('/').split('/')[-1].replace('-', ' ')
 
-            # Pick best MP4 ≤ 720p
+            # Pick HIGHEST quality MP4 capped at 1080p (Full HD)
             files = [f for f in video.get('video_files', [])
                      if 'mp4' in f.get('file_type', '')]
-            files.sort(key=lambda f: f.get('width', 0))
-            target = next((f for f in files if f.get('width', 9999) <= 1280), None)
-            if not target and files:
-                target = files[-1]
+            files.sort(key=lambda f: (f.get('width') or 0) * (f.get('height') or 0))
+            capped = [f for f in files
+                      if (f.get('height') or 0) <= 1080 and (f.get('width') or 0) <= 1920]
+            # Best file within 1080p; if only larger files exist, take the smallest of those
+            target = capped[-1] if capped else (files[0] if files else None)
             if not target:
                 continue
-
-            dl = req.get(target['link'], timeout=60)
-            if dl.status_code == 200:
-                return dl.content, photographer, alt_title
+            return target['link'], photographer, alt_title
         except Exception:
             time.sleep(0.3)
     return None, None, None
 
 
-def fetch_pexels_photo(query, pexels_key, req_module):
+def find_pexels_photo_url(query, pexels_key, req_module):
     """
-    Search Pexels Photos API and return (bytes, photographer, alt_text).
-    Returns (None, None, None) if nothing found.
+    Search Pexels Photos API and return (download_url, photographer, alt_text).
+    Highest quality: original file scaled to 1080p via Pexels CDN params.
+    Returns (None, None, None) if nothing found; ('AUTH_ERROR', None, None) on 401.
     """
     req = req_module
     fallbacks = [
@@ -538,13 +551,17 @@ def fetch_pexels_photo(query, pexels_key, req_module):
             if not photos:
                 continue
             photo = photos[0]
-            img_url = photo['src'].get('large2x') or photo['src'].get('large') or ''
+            # Highest quality: original file scaled to 1080p height via Pexels CDN
+            original = photo['src'].get('original') or ''
+            if original:
+                sep = '&' if '?' in original else '?'
+                img_url = f"{original}{sep}auto=compress&cs=tinysrgb&h=1080"
+            else:
+                img_url = photo['src'].get('large2x') or photo['src'].get('large') or ''
             alt = photo.get('alt', '') or ''
             photographer = photo.get('photographer', 'Pexels')
             if img_url:
-                dl = req.get(img_url, timeout=30)
-                if dl.status_code == 200:
-                    return dl.content, photographer, alt
+                return img_url, photographer, alt
         except Exception:
             time.sleep(0.3)
     return None, None, None
@@ -678,10 +695,12 @@ COST_OUTPUT_PER_MTOK = 4.00
 # CORE SYNCHRONOUS GENERATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_brolls(title, script, claude_key, pexels_key, audio_duration):
+def generate_plan(title, script, claude_key, pexels_key, audio_duration):
     """
-    Synchronous function: parse script → search pexels → build ZIP.
-    Returns: (zip_bytes, metadata_dict)
+    Parse script with Claude → search Pexels for media URLs (no downloads).
+    The browser downloads media directly from the Pexels CDN and builds the
+    ZIP client-side, keeping the server fast and light.
+    Returns: (scenes_list, guide_text, metadata_dict)
     Raises: Exception with user-facing error message.
     """
     import anthropic
@@ -812,7 +831,7 @@ Script:
 
     brolls.sort(key=lambda b: b['timeline_start'])
 
-    # ── Step 2: Search Pexels ──────────────────────────────────────────────
+    # ── Step 2: Search Pexels for media URLs (metadata only, fast) ────────
     scene_results = []
 
     for i, broll in enumerate(brolls):
@@ -824,27 +843,27 @@ Script:
         rationale = str(broll.get('rationale', '')).strip()
         timeline_start = float(broll.get('timeline_start', 0.0))
 
-        media_data = None
+        media_url = None
         photographer = 'Pexels'
         pexels_label = ''
         media_type = 'image'
         ext = '.jpg'
 
         # ── Try video first ────────────────────────────────────────────────
-        vdata, vphoto, vtitle = fetch_pexels_video(query, pexels_key, req)
-        if vdata:
-            media_data = vdata
+        vurl, vphoto, vtitle = find_pexels_video_url(query, pexels_key, req)
+        if vurl:
+            media_url = vurl
             photographer = vphoto or 'Pexels'
             pexels_label = vtitle or description
             media_type = 'video'
             ext = '.mp4'
         else:
             # ── Fall back to photo ─────────────────────────────────────────
-            pdata, pphoto, palt = fetch_pexels_photo(query, pexels_key, req)
-            if pdata == 'AUTH_ERROR':
-                raise Exception('Invalid Pexels API key. Check your key and try again.')
-            if pdata:
-                media_data = pdata
+            purl, pphoto, palt = find_pexels_photo_url(query, pexels_key, req)
+            if purl == 'AUTH_ERROR':
+                raise Exception('Pexels API key is invalid. Ask the admin to update it.')
+            if purl:
+                media_url = purl
                 photographer = pphoto or 'Pexels'
                 pexels_label = palt or description
                 media_type = 'image'
@@ -864,27 +883,14 @@ Script:
             'photographer': photographer,
             'pexels_label': pexels_label,
             'timeline_start': round(timeline_start, 2),
-            'success': media_data is not None,
-            '_data': media_data,
+            'success': media_url is not None,
+            'media_url': media_url,
         }
         scene_results.append(result)
 
-    # ── Step 3: Build ZIP ──────────────────────────────────────────────────
+    # ── Step 3: Build guide + metadata (ZIP is built in the browser) ──────
     total_duration = round(total_secs, 2)
-    zip_buffer = io.BytesIO()
-
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for r in scene_results:
-            if r['_data']:
-                zf.writestr(r['filename'], r['_data'])
-
-        guide = build_guide(title, scene_results, total_duration, audio_duration)
-        zf.writestr('CAPCUT_IMPORT_GUIDE.txt', guide)
-
-        clean = [{k: v for k, v in r.items() if not k.startswith('_')} for r in scene_results]
-        zf.writestr('scenes_data.json', json.dumps(clean, indent=2))
-
-    zip_bytes = zip_buffer.getvalue()
+    guide = build_guide(title, scene_results, total_duration, audio_duration)
 
     success_count = sum(1 for r in scene_results if r['success'])
     video_count = sum(1 for r in scene_results if r['success'] and r['media_type'] == 'video')
@@ -898,82 +904,130 @@ Script:
         'image_count': image_count,
     }
 
-    return zip_bytes, metadata
+    return scene_results, guide, metadata
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FLASK ROUTES
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Pages ────────────────────────────────────────────────────────────────────
+
 @app.route('/')
+@login_required
 def index():
     return Response(HTML, mimetype='text/html')
 
 
-@app.route('/api/test-claude', methods=['POST'])
-def test_claude():
-    key = (request.json or {}).get('claude_key', '').strip()
-    if not key:
-        return jsonify({'ok': False, 'error': 'No key provided'})
-    try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=key)
-        client.messages.create(
-            model='claude-haiku-4-5-20251001',
-            max_tokens=10,
-            messages=[{'role': 'user', 'content': 'Hi'}]
-        )
-        return jsonify({'ok': True})
-    except anthropic.AuthenticationError:
-        return jsonify({'ok': False, 'error': 'Invalid API key'})
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:80]})
+@app.route('/login')
+def login_page():
+    if session.get('is_admin'):
+        return redirect('/admin')
+    if session.get('username'):
+        return redirect('/')
+    return Response(LOGIN_HTML, mimetype='text/html')
 
 
-@app.route('/api/test-pexels', methods=['POST'])
-def test_pexels():
-    key = (request.json or {}).get('pexels_key', '').strip()
-    if not key:
-        return jsonify({'ok': False, 'error': 'No key provided'})
-    try:
-        import requests as req
-        r = req.get(
-            'https://api.pexels.com/v1/search?query=nature&per_page=1',
-            headers={'Authorization': key},
-            timeout=8
-        )
-        if r.status_code == 200:
-            return jsonify({'ok': True})
-        elif r.status_code == 401:
-            return jsonify({'ok': False, 'error': 'Invalid API key'})
-        else:
-            return jsonify({'ok': False, 'error': f'Pexels returned {r.status_code}'})
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:80]})
+@app.route('/admin')
+@admin_required
+def admin_page():
+    return Response(ADMIN_HTML, mimetype='text/html')
 
 
-@app.route('/api/generate', methods=['POST'])
-def generate():
-    """
-    Synchronous single endpoint: takes script, API keys, audio duration.
-    Returns ZIP file with media + guide + metadata.
-    Includes stats as HTTP response headers.
-    """
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect('/login')
+
+
+# ── Auth API ─────────────────────────────────────────────────────────────────
+
+@app.route('/api/login', methods=['POST'])
+def api_login():
     data = request.json or {}
+    username = (data.get('username') or '').strip().lower()
+    password = data.get('password') or ''
 
-    title = data.get('title', 'My Video').strip()
-    script = data.get('script', '').strip()
-    claude_key = data.get('claude_key', '').strip()
-    pexels_key = data.get('pexels_key', '').strip()
+    if not username or not password:
+        return jsonify({'error': 'Username and password are required'}), 400
+
+    # Admin login (credentials from environment)
+    if ADMIN_PASSWORD and username == ADMIN_USERNAME.lower() and password == ADMIN_PASSWORD:
+        session.permanent = True
+        session['username'] = username
+        session['is_admin'] = True
+        return jsonify({'ok': True, 'is_admin': True})
+
+    # Regular user login
+    user = db.verify_user(username, password)
+    if not user:
+        return jsonify({'error': 'Invalid username or password'}), 401
+    if not user.get('active', False):
+        return jsonify({'error': 'Your access has been revoked. Contact the admin.'}), 403
+
+    session.permanent = True
+    session['username'] = user['username']
+    session['is_admin'] = False
+    return jsonify({'ok': True, 'is_admin': False})
+
+
+@app.route('/api/me')
+@login_required
+def api_me():
+    username = session['username']
+    if session.get('is_admin'):
+        return jsonify({'username': username, 'is_admin': True,
+                        'balance': 0.0, 'total_spent': 0.0, 'runs': 0, 'usage': []})
+    user = db.get_user(username)
+    if not user or not user.get('active', False):
+        session.clear()
+        return jsonify({'error': 'Account not found or revoked'}), 401
+    return jsonify({
+        'username': username,
+        'is_admin': False,
+        'balance': round(user.get('balance_usd', 0.0), 4),
+        'total_spent': round(user.get('total_spent_usd', 0.0), 4),
+        'runs': user.get('runs', 0),
+        'usage': db.get_usage(username, limit=15),
+    })
+
+
+# ── Generation API ───────────────────────────────────────────────────────────
+
+@app.route('/api/plan', methods=['POST'])
+@login_required
+def api_plan():
+    """
+    Plan endpoint: Claude parse + Pexels URL search only (fast, small JSON).
+    Media download + ZIP packaging happen in the user's browser.
+    Charges the user actual Claude cost × markup.
+    """
+    username = session['username']
+    is_admin = session.get('is_admin', False)
+
+    # ── Gate: active user with balance ────────────────────────────────────
+    if not is_admin:
+        user = db.get_user(username)
+        if not user or not user.get('active', False):
+            session.clear()
+            return jsonify({'error': 'Your access has been revoked. Contact the admin.'}), 403
+        if user.get('balance_usd', 0.0) <= 0:
+            return jsonify({'error': 'Your credit is exhausted. Contact the admin to top up.'}), 402
+
+    # ── Resolve API keys (admin-managed; users never see them) ────────────
+    settings = db.get_settings()
+    claude_key = settings['claude_key']
+    pexels_key = settings['pexels_key']
+    if not claude_key or not pexels_key:
+        return jsonify({'error': 'The service is not configured yet (missing API keys). Contact the admin.'}), 503
+
+    data = request.json or {}
+    title = (data.get('title') or 'My Video').strip()
+    script = (data.get('script') or '').strip()
     audio_duration = data.get('audio_duration')
 
-    # Validation
     if not script:
         return jsonify({'error': 'Please provide a script.'}), 400
-    if not claude_key:
-        return jsonify({'error': 'Please enter your Claude API key.'}), 400
-    if not pexels_key:
-        return jsonify({'error': 'Please enter your Pexels API key.'}), 400
 
     if audio_duration is not None:
         try:
@@ -981,37 +1035,201 @@ def generate():
         except (TypeError, ValueError):
             audio_duration = None
 
-    # Generate
+    # ── Generate the plan ─────────────────────────────────────────────────
     try:
-        zip_bytes, metadata = generate_brolls(title, script, claude_key, pexels_key, audio_duration)
+        scenes, guide, metadata = generate_plan(title, script, claude_key, pexels_key, audio_duration)
     except Exception as e:
-        error_msg = str(e)
-        if 'Invalid Claude' in error_msg:
-            return jsonify({'error': error_msg}), 401
-        elif 'Invalid Pexels' in error_msg:
-            return jsonify({'error': error_msg}), 401
-        else:
-            return jsonify({'error': error_msg}), 500
+        return jsonify({'error': str(e)}), 500
 
-    # Build filename
+    # ── Charge the user (actual cost × markup); admin runs are free ───────
+    charged = 0.0
+    balance = 0.0
+    if not is_admin:
+        charged = round(metadata['cost_usd'] * settings['markup'], 4)
+        db.charge_user(username, metadata['cost_usd'], charged, title, metadata)
+        user = db.get_user(username)
+        balance = round(user.get('balance_usd', 0.0), 4)
+
+    # ── Build ZIP filename ────────────────────────────────────────────────
     safe_title = re.sub(r'[^\w\s-]', '', title).strip()
     safe_title = re.sub(r'\s+', '_', safe_title)[:60] or 'capcut_brolls'
-    download_name = f"{safe_title}_brolls.zip"
 
-    # Return ZIP with stats in headers
-    resp = send_file(
-        io.BytesIO(zip_bytes),
-        mimetype='application/zip',
-        as_attachment=True,
-        download_name=download_name
+    return jsonify({
+        'scenes': scenes,
+        'guide': guide,
+        'zip_name': f"{safe_title}_brolls.zip",
+        'stats': {
+            'scenes': metadata['scenes_done'],
+            'videos': metadata['video_count'],
+            'images': metadata['image_count'],
+            'duration': metadata['total_duration'],
+            'charged': charged,
+            'balance': balance,
+        },
+    })
+
+
+ALLOWED_PROXY_HOSTS = ('.pexels.com', 'pexels.com')
+
+
+@app.route('/api/proxy-media')
+@login_required
+def proxy_media():
+    """
+    Fallback media proxy for the rare case the browser can't fetch a Pexels
+    CDN file directly (CORS). Restricted to pexels.com hosts.
+    """
+    url = request.args.get('url', '')
+    host = urlparse(url).hostname or ''
+    if not (host == 'pexels.com' or host.endswith('.pexels.com')):
+        return jsonify({'error': 'Invalid media host'}), 400
+    try:
+        import requests as req
+        r = req.get(url, timeout=60)
+        if r.status_code != 200:
+            return jsonify({'error': f'Upstream returned {r.status_code}'}), 502
+        ctype = r.headers.get('Content-Type', 'application/octet-stream')
+        return Response(r.content, mimetype=ctype)
+    except Exception as e:
+        return jsonify({'error': str(e)[:100]}), 502
+
+
+# ── Admin API ────────────────────────────────────────────────────────────────
+
+@app.route('/api/admin/overview')
+@admin_required
+def admin_overview():
+    settings = db.get_settings()
+    return jsonify({
+        'users': [{
+            'username': u['username'],
+            'balance_usd': round(u.get('balance_usd', 0.0), 4),
+            'total_spent_usd': round(u.get('total_spent_usd', 0.0), 4),
+            'runs': u.get('runs', 0),
+            'active': u.get('active', False),
+        } for u in db.list_users()],
+        'settings': {
+            'markup': settings['markup'],
+            'claude_key_set': bool(settings['claude_key']),
+            'pexels_key_set': bool(settings['pexels_key']),
+        },
+        'totals': db.totals(),
+    })
+
+
+@app.route('/api/admin/usage')
+@admin_required
+def admin_usage():
+    username = request.args.get('username') or None
+    return jsonify({'usage': db.get_usage(username, limit=100)})
+
+
+@app.route('/api/admin/users', methods=['POST'])
+@admin_required
+def admin_create_user():
+    data = request.json or {}
+    try:
+        db.create_user(
+            data.get('username', ''),
+            data.get('password', ''),
+            balance_usd=float(data.get('credit') or 0),
+        )
+        return jsonify({'ok': True})
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+
+@app.route('/api/admin/users/<username>/credit', methods=['POST'])
+@admin_required
+def admin_add_credit(username):
+    amount = (request.json or {}).get('amount')
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Invalid amount'}), 400
+    if not db.get_user(username):
+        return jsonify({'error': 'User not found'}), 404
+    db.add_credit(username, amount)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/admin/users/<username>/toggle', methods=['POST'])
+@admin_required
+def admin_toggle_user(username):
+    user = db.get_user(username)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    db.set_user_active(username, not user.get('active', False))
+    return jsonify({'ok': True})
+
+
+@app.route('/api/admin/users/<username>/password', methods=['POST'])
+@admin_required
+def admin_set_password(username):
+    password = (request.json or {}).get('password') or ''
+    if not password:
+        return jsonify({'error': 'Password is required'}), 400
+    if not db.get_user(username):
+        return jsonify({'error': 'User not found'}), 404
+    db.set_user_password(username, password)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/admin/users/<username>', methods=['DELETE'])
+@admin_required
+def admin_delete_user(username):
+    if not db.get_user(username):
+        return jsonify({'error': 'User not found'}), 404
+    db.delete_user(username)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/admin/settings', methods=['POST'])
+@admin_required
+def admin_settings():
+    data = request.json or {}
+    db.update_settings(
+        claude_key=data.get('claude_key'),
+        pexels_key=data.get('pexels_key'),
+        markup=data.get('markup'),
     )
-    resp.headers['X-Cost-USD'] = str(metadata['cost_usd'])
-    resp.headers['X-Scenes'] = str(metadata['scenes_done'])
-    resp.headers['X-Videos'] = str(metadata['video_count'])
-    resp.headers['X-Images'] = str(metadata['image_count'])
-    resp.headers['X-Duration'] = str(metadata['total_duration'])
+    return jsonify({'ok': True})
 
-    return resp
+
+@app.route('/api/admin/test-keys', methods=['POST'])
+@admin_required
+def admin_test_keys():
+    settings = db.get_settings()
+    result = {'claude': {'ok': False, 'error': 'Not set'},
+              'pexels': {'ok': False, 'error': 'Not set'}}
+
+    if settings['claude_key']:
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=settings['claude_key'])
+            client.messages.create(
+                model='claude-haiku-4-5-20251001',
+                max_tokens=10,
+                messages=[{'role': 'user', 'content': 'Hi'}]
+            )
+            result['claude'] = {'ok': True, 'error': ''}
+        except Exception as e:
+            result['claude'] = {'ok': False, 'error': str(e)[:60]}
+
+    if settings['pexels_key']:
+        try:
+            import requests as req
+            r = req.get(
+                'https://api.pexels.com/v1/search?query=nature&per_page=1',
+                headers={'Authorization': settings['pexels_key']},
+                timeout=8
+            )
+            result['pexels'] = ({'ok': True, 'error': ''} if r.status_code == 200
+                                else {'ok': False, 'error': f'HTTP {r.status_code}'})
+        except Exception as e:
+            result['pexels'] = {'ok': False, 'error': str(e)[:60]}
+
+    return jsonify(result)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
